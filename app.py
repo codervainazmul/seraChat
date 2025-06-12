@@ -79,7 +79,31 @@ async def stream_chat(request: ChatRequest):
                 
                 # Stream the response
                 for completion in chat_completion:
-                    content = completion.choices[0].delta.content or ""
+                    delta = completion.choices[0].delta
+                    
+                    # Handle regular content
+                    content = getattr(delta, 'content', None) or ""
+                    
+                    # Handle reasoning models (deepseek-r1, etc.)
+                    reasoning = getattr(delta, 'reasoning', None)
+                    
+                    if reasoning:
+                        # If reasoning is an object, extract content
+                        if hasattr(reasoning, 'content'):
+                            reasoning_content = reasoning.content or ""
+                        else:
+                            reasoning_content = str(reasoning) if reasoning else ""
+                        
+                        if reasoning_content:
+                            full_response += reasoning_content
+                            data = {
+                                "type": "reasoning",
+                                "content": reasoning_content,
+                                "conversation_id": conversation_id,
+                                "model": request.model
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                    
                     if content:
                         full_response += content
                         data = {
@@ -142,7 +166,20 @@ async def regular_chat(request: ChatRequest):
             stream=False
         )
         
-        response_content = chat_completion.choices[0].message.content
+        message = chat_completion.choices[0].message
+        response_content = ""
+        
+        # Handle regular content
+        if hasattr(message, 'content') and message.content:
+            response_content += message.content
+        
+        # Handle reasoning models
+        if hasattr(message, 'reasoning') and message.reasoning:
+            reasoning = message.reasoning
+            if hasattr(reasoning, 'content'):
+                response_content += reasoning.content or ""
+            else:
+                response_content += str(reasoning)
         
         # Save assistant response to conversation
         conversations[conversation_id].append({"role": "assistant", "content": response_content})
