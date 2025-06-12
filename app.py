@@ -2,17 +2,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import json
 import uuid
+import traceback
 from g4f.client import Client
 
-app = FastAPI(title="Chat API", description="Streaming Chat API with Conversation Memory")
+app = FastAPI(title="Robust Chat API", description="Streaming Chat API with Better Error Handling")
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,7 +22,7 @@ app.add_middleware(
 # Initialize g4f client
 client = Client()
 
-# In-memory conversation storage (use Redis/Database in production)
+# In-memory conversation storage
 conversations: Dict[str, List[Dict[str, str]]] = {}
 
 class ChatRequest(BaseModel):
@@ -29,26 +30,54 @@ class ChatRequest(BaseModel):
     prompt: str
     conversation_id: Optional[str] = None
 
-class ChatResponse(BaseModel):
-    conversation_id: str
-    message: str
-    model: str
+def safe_extract_content(obj: Any, field_name: str = "content") -> str:
+    """Safely extract content from any object"""
+    if obj is None:
+        return ""
+    
+    try:
+        # Try direct access
+        if hasattr(obj, field_name):
+            value = getattr(obj, field_name)
+            if value is not None:
+                return str(value)
+        
+        # Try as dictionary
+        if isinstance(obj, dict) and field_name in obj:
+            return str(obj[field_name])
+        
+        # Try to convert the whole object
+        if isinstance(obj, str):
+            return obj
+        
+        # Try to get string representation
+        return str(obj)
+        
+    except Exception as e:
+        return f"[Content extraction error: {str(e)}]"
 
-@app.get("/")
-async def root():
-    return {
-        "message": "Chat API Server", 
-        "endpoints": {
-            "/chat/stream": "POST - Stream chat responses",
-            "/chat": "POST - Regular chat responses", 
-            "/conversations/{conversation_id}": "GET - Get conversation history",
-            "/conversations": "GET - List all conversations"
-        }
-    }
+def debug_object_structure(obj: Any, name: str = "object") -> str:
+    """Debug helper to understand object structure"""
+    try:
+        info = []
+        info.append(f"{name} type: {type(obj)}")
+        
+        if hasattr(obj, '__dict__'):
+            info.append(f"{name} dict: {obj.__dict__}")
+        
+        if hasattr(obj, 'content'):
+            info.append(f"{name}.content: {obj.content} (type: {type(obj.content)})")
+        
+        if hasattr(obj, 'reasoning'):
+            info.append(f"{name}.reasoning: {obj.reasoning} (type: {type(obj.reasoning)})")
+        
+        return " | ".join(info)
+    except:
+        return f"{name}: Could not debug"
 
 @app.post("/chat/stream")
 async def stream_chat(request: ChatRequest):
-    """Stream chat responses with conversation memory"""
+    """Robust streaming chat with better error handling"""
     try:
         # Generate conversation ID if not provided
         conversation_id = request.conversation_id or str(uuid.uuid4())
@@ -65,6 +94,9 @@ async def stream_chat(request: ChatRequest):
         
         def generate_response():
             try:
+                # Send conversation ID first
+                yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n"
+                
                 # Get streaming response from g4f
                 chat_completion = client.chat.completions.create(
                     model=request.model,
@@ -73,58 +105,92 @@ async def stream_chat(request: ChatRequest):
                 )
                 
                 full_response = ""
-                
-                # Send conversation ID first
-                yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n"
+                completion_count = 0
                 
                 # Stream the response
                 for completion in chat_completion:
-                    delta = completion.choices[0].delta
+                    completion_count += 1
                     
-                    # Handle regular content
-                    content = getattr(delta, 'content', None) or ""
-                    
-                    # Handle reasoning models (deepseek-r1, etc.)
-                    reasoning = getattr(delta, 'reasoning', None)
-                    
-                    if reasoning:
-                        # If reasoning is an object, extract content
-                        if hasattr(reasoning, 'content'):
-                            reasoning_content = reasoning.content or ""
-                        else:
-                            reasoning_content = str(reasoning) if reasoning else ""
+                    try:
+                        # Debug first few completions
+                        if completion_count <= 2:
+                            debug_info = {
+                                "type": "debug",
+                                "info": debug_object_structure(completion, "completion"),
+                                "conversation_id": conversation_id
+                            }
+                            yield f"data: {json.dumps(debug_info)}\n\n"
                         
-                        if reasoning_content:
-                            full_response += reasoning_content
+                        # Extract delta safely
+                        delta = None
+                        if hasattr(completion, 'choices') and completion.choices:
+                            choice = completion.choices[0]
+                            if hasattr(choice, 'delta'):
+                                delta = choice.delta
+                        
+                        if delta is None:
+                            continue
+                        
+                        # Handle content
+                        content = safe_extract_content(delta, 'content')
+                        if content and content != "[Content extraction error: 'NoneType' object has no attribute 'content']":
+                            full_response += content
                             data = {
-                                "type": "reasoning",
-                                "content": reasoning_content,
+                                "type": "content",
+                                "content": content,
                                 "conversation_id": conversation_id,
                                 "model": request.model
                             }
                             yield f"data: {json.dumps(data)}\n\n"
-                    
-                    if content:
-                        full_response += content
-                        data = {
-                            "type": "content",
-                            "content": content,
-                            "conversation_id": conversation_id,
-                            "model": request.model
+                        
+                        # Handle reasoning
+                        if hasattr(delta, 'reasoning') and delta.reasoning is not None:
+                            reasoning_content = safe_extract_content(delta.reasoning, 'content')
+                            
+                            # If no content field, try the whole reasoning object
+                            if not reasoning_content or reasoning_content.startswith("[Content extraction error"):
+                                reasoning_content = safe_extract_content(delta.reasoning)
+                            
+                            if reasoning_content and not reasoning_content.startswith("[Content extraction error"):
+                                full_response += reasoning_content
+                                data = {
+                                    "type": "reasoning",
+                                    "content": reasoning_content,
+                                    "conversation_id": conversation_id,
+                                    "model": request.model
+                                }
+                                yield f"data: {json.dumps(data)}\n\n"
+                        
+                        # Stop after reasonable number of completions to prevent infinite loops
+                        if completion_count > 1000:
+                            yield f"data: {json.dumps({'type': 'warning', 'content': 'Max completions reached'})}\n\n"
+                            break
+                            
+                    except Exception as delta_error:
+                        # Send delta error but continue
+                        error_data = {
+                            "type": "delta_error",
+                            "error": str(delta_error),
+                            "completion_count": completion_count,
+                            "conversation_id": conversation_id
                         }
-                        yield f"data: {json.dumps(data)}\n\n"
+                        yield f"data: {json.dumps(error_data)}\n\n"
+                        continue
                 
                 # Save assistant response to conversation
                 if full_response:
                     conversations[conversation_id].append({"role": "assistant", "content": full_response})
                 
                 # Send completion signal
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id, 'total_completions': completion_count})}\n\n"
                 
             except Exception as e:
+                # Send detailed error information
                 error_data = {
                     "type": "error",
                     "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "model": request.model,
                     "conversation_id": conversation_id
                 }
                 yield f"data: {json.dumps(error_data)}\n\n"
@@ -142,108 +208,45 @@ async def stream_chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/chat", response_model=ChatResponse)
-async def regular_chat(request: ChatRequest):
-    """Regular chat endpoint (non-streaming) with conversation memory"""
+@app.get("/")
+async def root():
+    return {"message": "Robust Chat API Server", "status": "running"}
+
+@app.get("/test-model/{model}")
+async def test_model(model: str):
+    """Test a model without streaming to see its structure"""
     try:
-        # Generate conversation ID if not provided
-        conversation_id = request.conversation_id or str(uuid.uuid4())
-        
-        # Get or create conversation history
-        if conversation_id not in conversations:
-            conversations[conversation_id] = []
-        
-        # Add user message to conversation
-        conversations[conversation_id].append({"role": "user", "content": request.prompt})
-        
-        # Prepare messages for API
-        messages = conversations[conversation_id].copy()
-        
-        # Get response from g4f (non-streaming)
-        chat_completion = client.chat.completions.create(
-            model=request.model,
-            messages=messages,
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Hello, test message"}],
             stream=False
         )
         
-        message = chat_completion.choices[0].message
-        response_content = ""
+        result = {
+            "model": model,
+            "response_type": str(type(response)),
+            "response_dir": dir(response),
+            "success": True
+        }
         
-        # Handle regular content
-        if hasattr(message, 'content') and message.content:
-            response_content += message.content
+        if hasattr(response, 'choices') and response.choices:
+            choice = response.choices[0]
+            message = choice.message
+            result["message_type"] = str(type(message))
+            result["message_dir"] = dir(message)
+            
+            if hasattr(message, '__dict__'):
+                result["message_dict"] = str(message.__dict__)
         
-        # Handle reasoning models
-        if hasattr(message, 'reasoning') and message.reasoning:
-            reasoning = message.reasoning
-            if hasattr(reasoning, 'content'):
-                response_content += reasoning.content or ""
-            else:
-                response_content += str(reasoning)
+        return result
         
-        # Save assistant response to conversation
-        conversations[conversation_id].append({"role": "assistant", "content": response_content})
-        
-        return ChatResponse(
-            conversation_id=conversation_id,
-            message=response_content,
-            model=request.model
-        )
-    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str):
-    """Get conversation history by ID"""
-    if conversation_id not in conversations:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    return {
-        "conversation_id": conversation_id,
-        "messages": conversations[conversation_id],
-        "message_count": len(conversations[conversation_id])
-    }
-
-@app.get("/conversations")
-async def list_conversations():
-    """List all conversation IDs"""
-    return {
-        "conversations": [
-            {
-                "conversation_id": conv_id,
-                "message_count": len(messages),
-                "last_message": messages[-1]["content"][:100] + "..." if messages else ""
-            }
-            for conv_id, messages in conversations.items()
-        ],
-        "total": len(conversations)
-    }
-
-@app.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
-    """Delete a conversation"""
-    if conversation_id not in conversations:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    del conversations[conversation_id]
-    return {"message": f"Conversation {conversation_id} deleted successfully"}
-
-@app.get("/models")
-async def get_available_models():
-    """Get list of available models"""
-    return {
-        "models": [
-            "gpt-4",
-            "gpt-4-turbo", 
-            "gpt-3.5-turbo",
-            "claude-3-opus-20240229",
-            "claude-3-sonnet-20240229",
-            "gemini-pro",
-            "llama-2-70b-chat"
-        ],
-        "note": "Model availability depends on g4f provider status"
-    }
+        return {
+            "model": model,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "success": False
+        }
 
 if __name__ == "__main__":
     import uvicorn
