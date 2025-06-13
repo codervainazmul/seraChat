@@ -101,7 +101,8 @@ async def stream_chat(request: ChatRequest):
                 chat_completion = client.chat.completions.create(
                     model=request.model,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    max_tokens= 9000
                 )
                 
                 full_response = ""
